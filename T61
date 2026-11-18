@@ -1,0 +1,853 @@
+//+------------------------------------------------------------------+
+//| Scalp                                         |
+//+------------------------------------------------------------------+
+
+#property strict
+#property strict
+#property copyright ""
+#property link        ""
+#include <stdlib.mqh>
+
+//--- inputs (names, order and defaults unchanged -> old .set files still load)
+input string Name_EA = "Scalp";
+input string Serial_Number = "";
+input int Magic = 985412;
+input bool FilterSpread = true;
+input int MaxAverageSpread = 35;
+input int SpreadTooHighDeleteOrderMin = 1;
+input ENUM_TIMEFRAMES IntervalMin = PERIOD_H1;
+input int LotVar = 1;
+input double Risk = 1.0;
+input double FixLot = 0.01;
+input bool UseTrailingStop = true;
+input int TrailingStop = 20;
+input bool UseVirtualTrailingStop = false;
+input int VirtualTrailingStop = 20;
+input int VirtualTrailingStart = 20;
+input int VirtualTrailingStep = 1;
+input int Distance = 0;
+input bool UseBreakEven = true;
+input double BreakEven = 10.0;
+input double BEpoint = 0.1;
+input double StopLoss = 240.0;
+input double TakeProfit = 1000.0;
+input string separator0 = "------ Display Settings ------";
+input bool ShowInfo = true;
+input int DisplayFont = 15;
+input color TextColor = clrWhite;
+input string separator1 = "------ Trading Days ------";
+input bool AutoGMT = true;
+input int GMTOffset = 0;
+input int Monday = 1;
+input int Tuesday = 1;
+input int Wednesday = 1;
+input int Thursday = 1;
+input int Friday = 1;
+input int Saturday = 0;
+input int Sunday = 0;
+input string separator2 = "------ Trading Hours ------";
+input string StartTimeMon = "03:00";
+input string StopTimeMon = "19:00";
+input string StartTimeTue = "03:00";
+input string StopTimeTue = "19:00";
+input string StartTimeWed = "03:00";
+input string StopTimeWed = "19:00";
+input string StartTimeThu = "03:00";
+input string StopTimeThu = "19:00";
+input string StartTimeFri = "03:00";
+input string StopTimeFri = "12:00";
+input string StartTimeSat = "03:00";
+input string StopTimeSat = "19:00";
+input string StartTimeSun = "03:00";
+input string StopTimeSun = "19:00";
+input string separator3 = "------ Pending Close Settings ------";
+input bool   Endhour    = false;   // true = Daily Close
+
+int  MaxPendingPerSide = 5;   // Máx. pendientes por lado (0 = sin límite)
+
+//--- constants (were hard-wired globals in the original)
+#define GMT_URL "http://clientsection.16mb.com/downloads/gmt.php"
+const int SLIPPAGE        = 30;
+const int PENDING_STEP_PIPS = 0;
+const int ZZ_DEPTH        = 20;
+const int ZZ_DEVIATION    = 5;
+const int ZZ_BACKSTEP     = 3;
+const int ZZ_SECOND_START = 12;   // shift where the second ZigZag scan starts
+const int LOT_DIVISOR     = 100;
+const int LABEL_CORNER    = 0;
+
+//--- state
+bool     g_blocked = false;        // true until a valid, unexpired key is found
+int      g_gmtOffset = 0;
+double   g_pip = 0.0;
+double   g_stopLevelPx = 0.0;     // MODE_STOPLEVEL * Point, captured at init
+double   g_trailPx = 0.0;
+double   g_beDistPx = 0.0;
+double   g_beLockPx = 0.0;
+double   g_slPx = 0.0;
+double   g_tpPx = 0.0;
+datetime g_lastBarTime = 0;       // last bar on which orders were managed
+int      g_openOrders = 0;        // market order count (for e-mail alerts)
+double   g_upperHi = 0.0;         // ZigZag levels, scan from shift 12
+double   g_lowerLo = 0.0;
+double   g_firstHi = 0.0;         // ZigZag levels, scan from shift 0
+double   g_firstLo = 0.0;
+double   g_vSlBuy = 0.0;          // virtual trailing levels
+double   g_vSlSell = 0.0;
+long     g_deleteAt = 0;          // when to delete pendings after high spread
+datetime g_spreadBarTime = 0;
+int      g_spreadTicks = 0;
+double   g_spreadSum = 0.0;
+double   g_avgSpread = 0.0;
+string   g_spreadText = "";
+bool     g_spreadTooHigh = false;
+
+double g_lastBuyStopSignal  = 0.0;  // g_upperHi con el que ya se colocó BUYSTOP
+double g_lastSellStopSignal = 0.0;  // g_lowerLo con el que ya se colocó SELLSTOP
+
+//+------------------------------------------------------------------+
+//| Small helpers                                                    |
+//+------------------------------------------------------------------+
+void WaitTradeAllowed(const int ms)
+  {
+   while(!IsTradeAllowed())
+      Sleep(ms);
+  }
+
+void WaitTradeContext(const int ms)
+  {
+   while(IsTradeContextBusy())
+      Sleep(ms);
+  }
+
+// buy + sell orders of this symbol/magic (original CountOrders(10))
+int CountMarketOrders()
+  {
+   int n = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderSymbol() != _Symbol)
+         continue;
+      if(OrderMagicNumber() != Magic)
+         continue;
+      if(OrderType() == OP_BUY || OrderType() == OP_SELL)
+         n++;
+     }
+   return n;
+  }
+
+// pending orders of this symbol/magic; false on first failure (original DeletePending(10))
+bool DeleteAllPending()
+  {
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         return false;
+      if(OrderSymbol() != _Symbol)
+         continue;
+      if(OrderMagicNumber() != Magic)
+         continue;
+      WaitTradeContext(100);
+      int t = OrderType();
+      if(t == OP_BUYSTOP || t == OP_SELLSTOP || t == OP_BUYLIMIT || t == OP_SELLLIMIT)
+         if(!OrderDelete(OrderTicket(), clrNONE))
+            return false;
+     }
+   return true;
+  }
+
+// SL/TP for the currently selected order, from the open price
+void ApplySlTp(const bool isBuy)
+  {
+   double open = OrderOpenPrice();
+   double sl = NormalizeDouble(isBuy ? open - g_slPx : open + g_slPx, Digits);
+   double tp = NormalizeDouble(isBuy ? open + g_tpPx : open - g_tpPx, Digits);
+   WaitTradeAllowed(50);
+   WaitTradeContext(50);
+   if(!OrderModify(OrderTicket(), OrderOpenPrice(), sl, tp, OrderExpiration(), clrNONE))
+     {
+      int err = GetLastError();
+      ResetLastError();
+      Print(OrderSymbol(), " Unable to set SL/TP! Error: ", err);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Lot size (was inlined twice in OnTick)                           |
+//| NOTE: exactly as decompiled - only LotVar == 1 computes a lot;   |
+//| any other LotVar gives 0.0, which is then raised to MODE_MINLOT. |
+//+------------------------------------------------------------------+
+
+double CalcLots()
+{
+   double minLot = MarketInfo(_Symbol, MODE_MINLOT);
+   double maxLot = MarketInfo(_Symbol, MODE_MAXLOT);
+   double step   = MarketInfo(_Symbol, MODE_LOTSTEP);
+
+   int lotDigits = 0;
+   if(step == 0.001) lotDigits = 3;
+   if(step == 0.01)  lotDigits = 2;
+   if(step == 0.1)   lotDigits = 1;
+   if(step == 1.0)   lotDigits = 0;
+
+   double lots = minLot;
+
+   if(LotVar == 2)          // original: según margen libre
+      lots = AccountFreeMargin() / LOT_DIVISOR * minLot;
+   else if(LotVar == 1)     // variable: % de riesgo sobre el balance, usando el StopLoss
+   {
+      double tickValue = MarketInfo(_Symbol, MODE_TICKVALUE);
+      double tickSize  = MarketInfo(_Symbol, MODE_TICKSIZE);
+      if(tickValue > 0 && tickSize > 0 && g_slPx > 0)
+      {
+         double riskMoney = AccountBalance() * Risk / 100.0;
+         double lossPerLot = g_slPx / tickSize * tickValue;
+         lots = riskMoney / lossPerLot;
+      }
+   }
+   else if(LotVar == 0)     // lote fijo
+      lots = FixLot;
+
+   lots = MathFloor(lots / step) * step;   // ajusta al paso del broker
+   lots = NormalizeDouble(lots, lotDigits);
+
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   return lots;
+}
+
+//+------------------------------------------------------------------+
+//| ZigZag levels (was func_3f6)                                     |
+//+------------------------------------------------------------------+
+void AccumulatePivot(const double v, double &hi, double &lo)
+  {
+   if(v <= 0.0)
+      return;
+   if(lo == 0.0)
+     {
+      lo = v;
+      hi = v;
+      return;
+     }
+   if(v > hi)
+      hi = v;
+   if(v < lo)
+      lo = v;
+  }
+
+void UpdateZigZagLevels()
+  {
+   double hi = 0.0, lo = 0.0;
+   int shift = 0;
+   do
+     {
+      AccumulatePivot(iCustom(_Symbol, 0, "ZigZag", ZZ_DEPTH, ZZ_DEVIATION, ZZ_BACKSTEP, 0, shift), hi, lo);
+      shift++;
+     }
+   while(lo == hi);
+   g_firstHi = NormalizeDouble(hi, 5);
+   g_firstLo = NormalizeDouble(lo, 5);
+
+   shift = ZZ_SECOND_START;
+   hi = 0.0;
+   lo = 0.0;
+   int tries = 300;
+   do
+     {
+      AccumulatePivot(iCustom(_Symbol, 0, "ZigZag", ZZ_DEPTH, ZZ_DEVIATION, ZZ_BACKSTEP, 0, shift), hi, lo);
+      shift++;
+      tries++;
+      if(lo != hi)
+         break;
+     }
+   while(tries < 600);
+   if(tries == 600)
+      return;
+   g_upperHi = NormalizeDouble(hi, 5);
+   g_lowerLo = NormalizeDouble(lo, 5);
+  }
+
+//+------------------------------------------------------------------+
+//| Trading time window (was func_3f7)                               |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+  {
+   int enabled;
+   string startStr, stopStr;
+   switch(DayOfWeek())
+     {
+      case 1: enabled = Monday;    startStr = StartTimeMon; stopStr = StopTimeMon; break;
+      case 2: enabled = Tuesday;   startStr = StartTimeTue; stopStr = StopTimeTue; break;
+      case 3: enabled = Wednesday; startStr = StartTimeWed; stopStr = StopTimeWed; break;
+      case 4: enabled = Thursday;  startStr = StartTimeThu; stopStr = StopTimeThu; break;
+      case 5: enabled = Friday;    startStr = StartTimeFri; stopStr = StopTimeFri; break;
+      case 6: enabled = Saturday;  startStr = StartTimeSat; stopStr = StopTimeSat; break;
+      default: enabled = Sunday;   startStr = StartTimeSun; stopStr = StopTimeSun; break;
+     }
+   if(enabled != 1)
+      return false;
+
+   string day = StringConcatenate(Year(), ".", Month(), ".", Day(), " ");
+   long shiftSec = (long)g_gmtOffset * 3600;
+   long from = (long)StringToTime(day + startStr) + shiftSec;
+   long to = (long)StringToTime(day + stopStr) + shiftSec;
+   return (TimeCurrent() > from && TimeCurrent() < to);
+  }
+
+//+------------------------------------------------------------------+
+//| Average spread per IntervalMin bar + delayed pending delete      |
+//+------------------------------------------------------------------+
+void UpdateSpreadStats()
+  {
+   datetime barTime = iTime(_Symbol, IntervalMin, 0);
+   if(barTime > g_spreadBarTime)
+     {
+      g_spreadTicks = 0;
+      g_spreadSum = 0.0;
+      g_spreadBarTime = barTime;
+     }
+   g_spreadTicks++;
+   g_spreadSum += (Ask - Bid) / g_pip;
+   g_avgSpread = g_spreadSum / g_spreadTicks;
+
+   if(FilterSpread && g_avgSpread > MaxAverageSpread)
+     {
+      g_spreadText = DoubleToStr(g_avgSpread, 2) + " Max Average Spread too high!";
+      g_spreadTooHigh = true;
+     }
+   else
+     {
+      g_spreadText = DoubleToStr(g_avgSpread, 2);
+      g_spreadTooHigh = false;
+     }
+
+   if(g_deleteAt > 0)
+     {
+      if(g_spreadTooHigh && TimeCurrent() >= g_deleteAt)
+        {
+         for(int i = OrdersTotal() - 1; i >= 0; i--)
+           {
+            if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+               continue;
+            if(OrderSymbol() != _Symbol)
+               continue;
+            if(OrderMagicNumber() != Magic)
+               continue;
+            if(OrderType() <= OP_SELL)
+               continue;
+            OrderDelete(OrderTicket(), clrAliceBlue);
+            i++;   // kept from original: re-visits the same index after a delete
+           }
+         g_deleteAt = 0;
+        }
+      else
+         if(TimeCurrent() >= g_deleteAt)
+            g_deleteAt = 0;
+     }
+   if(g_spreadTooHigh && g_deleteAt == 0)
+      g_deleteAt = TimeCurrent() + SpreadTooHighDeleteOrderMin * 60;
+  }
+
+//+------------------------------------------------------------------+
+//| Info panel (was func_400)                                        |
+//+------------------------------------------------------------------+
+void DrawInfoPanel()
+  {
+   if(!ShowInfo)
+      return;
+
+   string lines[11];
+   lines[1]  = "GMT Offset: " + IntegerToString(g_gmtOffset);
+   lines[2]  = "Current Spread = " + DoubleToStr((Ask - Bid) / g_pip, 1);
+   lines[3]  = "Average Spread = " + g_spreadText;
+   lines[4]  = "Account Leverage:     " + DoubleToStr(AccountLeverage(), 0);
+   lines[5]  = "Account Balance:      " + DoubleToStr(AccountBalance(), 2);
+   lines[6]  = "Account Equity:         " + DoubleToStr(AccountEquity(), 2);
+   lines[7]  = "Free Margin:              " + DoubleToStr(AccountFreeMargin(), 2);
+   lines[8]  = "Used Margin:             " + DoubleToStr(AccountMargin(), 2);
+   lines[9]  = "";
+   lines[10] = "-------------------------------------------";
+
+   int y = 24;
+   for(int i = 1; i < 11; i++)
+     {
+      string name = "Info" + IntegerToString(i);
+      ObjectCreate(name, OBJ_LABEL, 0, 0, 0.0, 0, 0.0, 0, 0.0);
+      color clr = TextColor;
+      if(i == 3)
+         clr = g_spreadTooHigh ? clrRed : clrLimeGreen;
+      ObjectSetText(name, lines[i], DisplayFont, "Arial", clr);
+      ObjectSet(name, OBJPROP_CORNER, LABEL_CORNER);
+      ObjectSet(name, OBJPROP_XDISTANCE, 7);
+      ObjectSet(name, OBJPROP_YDISTANCE, y);
+      y += 9 + DisplayFont;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Trailing stop (was func_401)                                     |
+//+------------------------------------------------------------------+
+void TrailingStopProc()
+  {
+   if(TrailingStop <= 0)
+      return;
+   if(!UseTrailingStop)
+      return;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderSymbol() != _Symbol)
+         continue;
+      if(OrderMagicNumber() != Magic)
+         continue;
+
+      if(OrderType() == OP_BUY)
+        {
+         double mktBid = MarketInfo(_Symbol, MODE_BID);
+         if(mktBid - OrderOpenPrice() > g_trailPx)
+           {
+            double newSl = NormalizeDouble(mktBid - g_trailPx, Digits);
+            if(OrderStopLoss() < newSl)
+              {
+               RefreshRates();
+               if(Bid - newSl <= MarketInfo(_Symbol, MODE_STOPLEVEL) * Point)
+                  newSl = Bid - MarketInfo(_Symbol, MODE_STOPLEVEL) * Point;
+               if(!OrderModify(OrderTicket(), OrderOpenPrice(), newSl, OrderTakeProfit(), 0, clrGreen))
+                 {
+                  int err = GetLastError();
+                  ResetLastError();
+                  string desc = ErrorDescription(err);
+                  Print(OrderSymbol(), " Error modifying buy trade ", OrderTicket(), ". Error: ", desc);
+                 }
+              }
+           }
+        }
+
+      if(OrderType() != OP_SELL)
+         continue;
+      double mktAsk = MarketInfo(_Symbol, MODE_ASK);
+      if(!(OrderOpenPrice() - mktAsk > g_trailPx))
+         continue;
+      double newSl = NormalizeDouble(mktAsk + g_trailPx, Digits);
+      if(OrderStopLoss() > newSl || OrderStopLoss() == 0.0)
+        {
+         RefreshRates();
+         if(newSl - Ask <= MarketInfo(_Symbol, MODE_STOPLEVEL) * Point)
+            newSl = MarketInfo(_Symbol, MODE_STOPLEVEL) * Point + Ask;
+         if(!OrderModify(OrderTicket(), OrderOpenPrice(), newSl, OrderTakeProfit(), 0, clrRed))
+           {
+            int err = GetLastError();
+            ResetLastError();
+            string desc = ErrorDescription(err);
+            Print(OrderSymbol(), " Error modifying sell trade ", OrderTicket(), ". Error: ", desc);
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Break-even (was func_402)                                        |
+//+------------------------------------------------------------------+
+void BreakEvenProc()
+  {
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         return;
+      if(OrderType() > OP_SELL)
+         continue;
+      if(OrderSymbol() != _Symbol)
+         continue;
+      if(OrderMagicNumber() != Magic)
+         continue;
+
+      double sl = OrderStopLoss();
+      if(OrderType() == OP_BUY)
+        {
+         RefreshRates();
+         double newSl = NormalizeDouble(OrderOpenPrice() + g_beLockPx, Digits);
+         if(Bid - OrderOpenPrice() > g_beDistPx
+            && (newSl > sl || sl == 0.0)
+            && newSl < Bid - g_stopLevelPx
+            && MathAbs(newSl - sl) > Point)
+           {
+            WaitTradeAllowed(500);
+            RefreshRates();
+            if(OrderModify(OrderTicket(), OrderOpenPrice(), newSl, OrderTakeProfit(), 0, clrGreen))
+               return;
+           }
+        }
+
+      if(OrderType() != OP_SELL)
+         continue;
+      RefreshRates();
+      double newSl = NormalizeDouble(OrderOpenPrice() - g_beLockPx, Digits);
+      if(OrderOpenPrice() - Ask > g_beDistPx
+         && (newSl < sl || sl == 0.0)
+         && newSl > Ask + g_stopLevelPx
+         && MathAbs(newSl - sl) > Point)
+        {
+         WaitTradeAllowed(500);
+         RefreshRates();
+         if(OrderModify(OrderTicket(), OrderOpenPrice(), newSl, OrderTakeProfit(), 0, clrRed))
+           {
+            // as decompiled: this log line runs after a *successful* sell modify
+            int err = GetLastError();
+            ResetLastError();
+            Print("Error modify SELL order : ", err);
+            return;
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Re-apply SL/TP on orders younger than 35 s (was func_414)        |
+//+------------------------------------------------------------------+
+void FixNewOrderSlTp()
+  {
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderSymbol() != _Symbol)
+         continue;
+      if(OrderMagicNumber() != Magic)
+         continue;
+      if(!(TimeCurrent() < OrderOpenTime() + 35))
+         continue;
+      if(OrderType() != OP_BUY && OrderType() != OP_SELL)
+         continue;
+
+      double open = OrderOpenPrice();
+      bool slOff = (NormalizeDouble(MathAbs(open - OrderStopLoss()) - g_slPx, Digits) > 0.0 && g_slPx > 0.0);
+      bool tpOff = (NormalizeDouble(MathAbs(OrderTakeProfit() - open) - g_tpPx, Digits) > 0.0 && g_tpPx > 0.0);
+      if(slOff || tpOff)
+         ApplySlTp(OrderType() == OP_BUY);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Virtual trailing stop / virtual SL+TP (was func_416)             |
+//+------------------------------------------------------------------+
+void DrawHLine(const string name, const double price, const color clr)
+  {
+   if(ObjectFind(name) != -1)
+      ObjectDelete(name);
+   ObjectCreate(name, OBJ_HLINE, 0, 0, price, 0, 0.0, 0, 0.0);
+   ObjectSet(name, OBJPROP_COLOR, clr);
+   ObjectSet(name, OBJPROP_STYLE, STYLE_DOT);
+   ObjectSet(name, OBJPROP_WIDTH, 1);
+  }
+
+void VirtualTrailingProc()
+  {
+   if(!UseVirtualTrailingStop)
+      return;
+
+   int buys = 0, sells = 0;
+   int lastBuyTicket = 0, lastSellTicket = 0;
+
+   for(int i = 0; i < OrdersTotal(); i++)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderSymbol() != _Symbol || OrderMagicNumber() != Magic)
+         continue;
+
+      int type = OrderType();
+      double open = NormalizeDouble(OrderOpenPrice(), Digits);
+
+      if(type == OP_BUY)
+        {
+         buys++;
+         lastBuyTicket = OrderTicket();
+         if(StopLoss != 0.0 && Bid <= open - StopLoss * g_pip
+            && OrderClose(OrderTicket(), OrderLots(), NormalizeDouble(Bid, Digits), SLIPPAGE, clrNONE))
+            continue;
+         if(TakeProfit != 0.0 && Bid >= TakeProfit * g_pip + open
+            && OrderClose(OrderTicket(), OrderLots(), NormalizeDouble(Bid, Digits), SLIPPAGE, clrNONE))
+            continue;
+         if(VirtualTrailingStop > 0)
+           {
+            double trail = NormalizeDouble(Bid - VirtualTrailingStop * g_pip, Digits);
+            if(trail >= VirtualTrailingStart * g_pip + open)
+               if(g_vSlBuy == 0.0 || g_vSlBuy + VirtualTrailingStep * g_pip < trail)
+                  g_vSlBuy = trail;
+           }
+        }
+
+      if(type == OP_SELL)
+        {
+         sells++;
+         if(StopLoss != 0.0 && Ask >= StopLoss * g_pip + open
+            && OrderClose(OrderTicket(), OrderLots(), NormalizeDouble(Ask, Digits), SLIPPAGE, clrNONE))
+            continue;
+         if(TakeProfit != 0.0 && Ask <= open - TakeProfit * g_pip
+            && OrderClose(OrderTicket(), OrderLots(), NormalizeDouble(Ask, Digits), SLIPPAGE, clrNONE))
+            continue;
+         lastSellTicket = OrderTicket();
+         if(VirtualTrailingStop > 0)
+           {
+            double trail = NormalizeDouble(VirtualTrailingStop * g_pip + Ask, Digits);
+            if(trail <= open - VirtualTrailingStart * g_pip)
+               if(g_vSlSell == 0.0 || g_vSlSell - VirtualTrailingStep * g_pip > trail)
+                  g_vSlSell = trail;
+           }
+        }
+     }
+
+   if(buys > 0)
+     {
+      if(buys <= 1 && g_vSlBuy != 0.0)
+        {
+         DrawHLine("SL Buy", g_vSlBuy, clrBlue);
+         double px = NormalizeDouble(Bid, Digits);
+         if(Bid <= g_vSlBuy
+            && OrderSelect(lastBuyTicket, SELECT_BY_TICKET, MODE_TRADES)
+            && OrderProfit() > 0.0
+            && !OrderClose(lastBuyTicket, OrderLots(), px, SLIPPAGE, clrRed))
+            Comment("");
+        }
+     }
+   else
+     {
+      g_vSlBuy = 0.0;
+      ObjectDelete("SL Buy");
+     }
+
+   if(sells > 0)
+     {
+      if(sells > 1 || g_vSlSell == 0.0)
+         return;
+      DrawHLine("SL Sell", g_vSlSell, clrRed);
+      if(Ask >= g_vSlSell
+         && OrderSelect(lastSellTicket, SELECT_BY_TICKET, MODE_TRADES)
+         && OrderProfit() > 0.0
+         && !OrderClose(lastSellTicket, OrderLots(), NormalizeDouble(Ask, Digits), SLIPPAGE, clrRed))
+         Comment("");
+     }
+   else
+     {
+      g_vSlSell = 0.0;
+      ObjectDelete("SL Sell");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Stop-order placement (was inlined twice in OnTick)               |
+//+------------------------------------------------------------------+
+void PlaceStopOrder(const int cmd, const int slot = 0)
+  {
+   double lots = CalcLots();
+   double stopDist = MarketInfo(_Symbol, MODE_STOPLEVEL) * Point;
+   double price;
+
+   if(cmd == OP_BUYSTOP)
+     {
+      // cada slot se separa PendingStepPips hacia arriba del pivote
+      price = NormalizeDouble(g_upperHi + (Distance + slot * PENDING_STEP_PIPS) * g_pip, Digits); // BUYSTOP
+      if(price - MarketInfo(_Symbol, MODE_ASK) <= stopDist)
+         price = MarketInfo(_Symbol, MODE_ASK) + stopDist;
+     }
+   else
+     {
+      price = NormalizeDouble(g_lowerLo - (Distance + slot * PENDING_STEP_PIPS) * g_pip, Digits); // SELLSTOP
+      if(MarketInfo(_Symbol, MODE_BID) - price <= stopDist)
+         price = MarketInfo(_Symbol, MODE_BID) - stopDist;
+     }
+
+   WaitTradeAllowed(50);
+   WaitTradeContext(50);
+   int ticket = OrderSend(_Symbol, cmd, lots, price, SLIPPAGE, 0.0, 0.0, Name_EA, Magic, 0, clrNONE);
+   if(ticket > 0)
+     {
+      if(OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+         ApplySlTp(cmd == OP_BUYSTOP);
+     }
+   else
+     {
+      int err = GetLastError();
+      ResetLastError();
+      Print(_Symbol, " Unable to open order! Error: ", err);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int ResolveGmtOffset()
+  {
+   if(!(AutoGMT && !IsTesting()))
+      return GMTOffset;
+
+   char postData[], result[];
+   string resultHeaders = "";
+   RefreshRates();
+   datetime serverNow = TimeCurrent();
+   if(WebRequest("GET", GMT_URL, "", 10, postData, result, resultHeaders) != -1)
+     {
+      string body = CharArrayToString(result, 0, -1, 0);
+      int offset = (int)MathRound((double)((long)serverNow - (long)StrToTime(body)) / 3600.0);
+      ArrayFree(result);
+      ArrayFree(postData);
+      return offset;
+     }
+   int err = GetLastError();
+   ResetLastError();
+   Print("Error: ", err);
+   MessageBox("Add the address '" + GMT_URL + "' in the list of allowed URLs on tab 'Expert Advisors'", "Error", 64);
+   ExpertRemove();
+   return 0;
+  }
+
+int OnInit()
+  {
+   g_gmtOffset = ResolveGmtOffset();
+
+   g_stopLevelPx = MarketInfo(_Symbol, MODE_STOPLEVEL) * Point;
+   g_pip = (Digits == 5 || Digits == 3) ? Point * 10.0 : Point;
+   g_trailPx = TrailingStop * g_pip;
+   g_slPx = StopLoss * g_pip;
+   g_tpPx = TakeProfit * g_pip;
+   g_beDistPx = BreakEven * g_pip;
+   g_beLockPx = BEpoint * g_pip;
+   g_blocked = true;
+
+g_lastBuyStopSignal  = 0.0;
+g_lastSellStopSignal = 0.0;
+
+   // --- VALIDACIÓN DE SERIE ELIMINADA ---
+   // Establecemos g_blocked en false para que el EA opere libremente sin clave
+   g_blocked = false; 
+
+   g_openOrders = CountMarketOrders();
+   return INIT_SUCCEEDED;
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick                                                      |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   if(IsTradingTime())
+      UpdateSpreadStats();
+
+   DrawInfoPanel();
+   FixNewOrderSlTp();
+
+   TrailingStopProc();
+   VirtualTrailingProc();
+   if(UseBreakEven)
+      BreakEvenProc();
+
+   if(!IsTradingTime())
+   {
+   if(Endhour)
+   {
+      while(!DeleteAllPending())
+      {
+      }
+   }
+   return;
+   }
+
+   //--- once per new chart bar
+   datetime barTime = Time[0];
+   if(g_lastBarTime == barTime)
+      return;
+
+   UpdateZigZagLevels();
+
+// remove stale stop orders (versión compatible con múltiples pendientes)
+for(int i = OrdersTotal() - 1; i >= 0; i--)
+  {
+   if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      continue;
+   if(OrderSymbol() != _Symbol || OrderMagicNumber() != Magic)
+      continue;
+   if(OrderType() != OP_BUYSTOP && OrderType() != OP_SELLSTOP)
+      continue;
+
+   if(OrderType() == OP_BUYSTOP && g_upperHi > Ask && g_upperHi == g_firstHi
+      && OrderOpenPrice() < g_upperHi)          // por debajo del pivote → inválida
+      {
+       if(!OrderDelete(OrderTicket(), clrNONE))
+          Print("Error deleting BUYSTOP order.");
+      }
+
+   if(OrderType() == OP_SELLSTOP && g_lowerLo < Bid && g_lowerLo == g_firstLo
+      && OrderOpenPrice() > g_lowerLo)          // por encima del pivote → inválida
+      {
+       if(!OrderDelete(OrderTicket(), clrNONE))
+          Print("Error deleting SELLSTOP order.");
+      }
+  }
+
+//--- 1) contar pendientes por lado y ver si hay posición de mercado
+int countBuyStop = 0, countSellStop = 0;
+bool hasBuy = false, hasSell = false;
+
+for(int i = 0; i < OrdersTotal(); i++)
+  {
+   if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      continue;
+   if(Magic >= 0 && OrderMagicNumber() != Magic)
+      continue;
+   if(OrderSymbol() != _Symbol)
+      continue;
+   switch(OrderType())
+     {
+      case OP_BUYSTOP:  countBuyStop++;  break;
+      case OP_SELLSTOP: countSellStop++; break;
+      case OP_BUY:      hasBuy = true;   break;
+      case OP_SELL:     hasSell = true;  break;
+     }
+  }
+
+
+bool limitBuyOk      = (MaxPendingPerSide <= 99 || countBuyStop  < MaxPendingPerSide);
+bool limitSellOk     = (MaxPendingPerSide <= 99 || countSellStop < MaxPendingPerSide);
+
+//--- 2) BUYSTOP: solo si este pivote (g_upperHi) aún no ha sido usado
+if(limitBuyOk && !g_spreadTooHigh
+   && g_upperHi > 0.0 && Bid < g_upperHi && g_upperHi >= g_firstHi
+   && MathAbs(g_upperHi - g_lastBuyStopSignal) > _Point * 0.5)   // pivote nuevo
+  {
+   PlaceStopOrder(OP_BUYSTOP, countBuyStop);
+   g_lastBuyStopSignal = g_upperHi;
+  }
+
+//--- 3) SELLSTOP: solo si este pivote (g_lowerLo) aún no ha sido usado
+if(limitSellOk && !g_spreadTooHigh
+   && g_lowerLo > 0.0 && Ask > g_lowerLo && g_lowerLo <= g_firstLo
+   && MathAbs(g_lowerLo - g_lastSellStopSignal) > _Point * 0.5)  // pivote nuevo
+  {
+   PlaceStopOrder(OP_SELLSTOP, countSellStop);
+   g_lastSellStopSignal = g_lowerLo;
+  }
+
+g_lastBarTime = barTime;
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   for(int i = ObjectsTotal(EMPTY) - 1; i >= 0; i--)
+     {
+      string name = ObjectName(0, i, -1, -1);
+      if(StringFind(name, "Info", 0) < 0)
+         continue;
+      ObjectDelete(0, name);
+      i++;   // kept from original
+     }
+   ObjectsDeleteAll(0, 0, OBJ_TREND);
+   ObjectsDeleteAll(0, 0, OBJ_TEXT);
+  }
+//+------------------------------------------------------------------+
